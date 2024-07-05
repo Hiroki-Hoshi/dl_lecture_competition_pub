@@ -16,6 +16,8 @@ import torch.utils.data
 from torchvision.transforms import RandomCrop
 from torchvision import transforms as tf
 from torch.utils.data import Dataset
+import random
+from PIL import Image
 
 
 from src.utils import RepresentationType, VoxelGrid, flow_16bit_to_float
@@ -319,6 +321,11 @@ class Sequence(Dataset):
     def get_data(self, index) -> Dict[str, any]:
         ts_start: int = self.timestamps_flow[index] - self.delta_t_us
         ts_end: int = self.timestamps_flow[index]
+        
+        # 追加: 直後のフレームのタイムスタンプ
+        ts_start_next = self.timestamps_flow[index + 1] - self.delta_t_us if index < len(self.timestamps_flow) - 1 else ts_start
+        ts_end_next = self.timestamps_flow[index + 1] if index < len(self.timestamps_flow) - 1 else ts_end
+
 
         file_index = self.indices[index]
 
@@ -340,6 +347,17 @@ class Sequence(Dataset):
         xy_rect = self.rectify_events(x, y)
         x_rect = xy_rect[:, 0]
         y_rect = xy_rect[:, 1]
+        
+        # 追加: 直後のフレームのイベントデータ取得
+        event_data_next = self.event_slicer.get_events(ts_start_next, ts_end_next)
+        p_next = event_data_next['p']
+        t_next = event_data_next['t']
+        x_next = event_data_next['x']
+        y_next = event_data_next['y']
+
+        xy_rect_next = self.rectify_events(x_next, y_next)
+        x_rect_next = xy_rect_next[:, 0]
+        y_rect_next = xy_rect_next[:, 1]
 
         if self.voxel_grid is None:
             raise NotImplementedError
@@ -347,6 +365,10 @@ class Sequence(Dataset):
             event_representation = self.events_to_voxel_grid(
                 p, t, x_rect, y_rect)
             output['event_volume'] = event_representation
+            
+            # 追加: 直後のフレームのボクセルグリッド変換
+            event_representation_next = self.events_to_voxel_grid(p_next, t_next, x_rect_next, y_rect_next)
+            output['event_volume_next'] = event_representation_next
         output['name_map'] = self.name_idx
         
         if self.load_gt:
@@ -553,6 +575,8 @@ class DatasetProvider:
         available_seqs = os.listdir(train_path)
 
         seqs = available_seqs
+        # self.transform = transform
+
 
         train_sequences: list[Sequence] = []
         for seq in seqs:
@@ -590,9 +614,13 @@ def train_collate(sample_list):
         if field_name == 'new_sequence':
             batch['new_sequence'] = [sample[field_name]
                                      for sample in sample_list]
+        # if field_name.startswith("event_volume"):
+            # batch[field_name] = torch.stack(
+            #     [sample[field_name] for sample in sample_list])
         if field_name.startswith("event_volume"):
-            batch[field_name] = torch.stack(
-                [sample[field_name] for sample in sample_list])
+            batch[field_name] = torch.stack([sample[field_name] for sample in sample_list])
+        if field_name.startswith("event_volume_next"):
+            batch[field_name] = torch.stack([sample[field_name] for sample in sample_list])
         if field_name.startswith("flow_gt"):
             if all(field_name in x for x in sample_list):
                 batch[field_name] = torch.stack(
@@ -610,3 +638,4 @@ def rec_train_collate(sample_list):
         seq_of_batch.append(train_collate(
             [sample[i] for sample in sample_list]))
     return seq_of_batch
+
