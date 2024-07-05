@@ -1,10 +1,11 @@
-# import torch
+import torch
 import hydra
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 import random
 import numpy as np
-from src.models.evflownet import EVFlowNet
+# from src.models.evflownet import EVFlowNet
+from src.models.evflownet import RAFTlikeNet
 from src.datasets import DatasetProvider
 from enum import Enum, auto
 from src.datasets import train_collate
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Dict, Any
 import os
 import time
+from transformers import get_cosine_schedule_with_warmup
+import torchvision.transforms as transforms
 
 
 class RepresentationType(Enum):
@@ -43,6 +46,13 @@ def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     file_name: str => ファイル名
     '''
     np.save(f"{file_name}.npy", flow.cpu().numpy())
+
+# def compute_multiscale_loss(predictions, ground_truth):
+#   total_loss = 0.0
+#   for prediction in predictions:
+#     loss = compute_epe_error(prediction, ground_truth)
+#     total_loss += loss
+#   return total_loss
 
 @hydra.main(version_base=None, config_path="configs", config_name="base")
 def main(args: DictConfig):
@@ -83,6 +93,7 @@ def main(args: DictConfig):
     train_set = loader.get_train_dataset()
     test_set = loader.get_test_dataset()
     collate_fn = train_collate
+    # transform = transforms.Compose([transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4,hue=0.5/np.pi),transforms.ToTensor()])
     train_data = DataLoader(train_set,
                                  batch_size=args.data_loader.train.batch_size,
                                  shuffle=args.data_loader.train.shuffle,
@@ -110,31 +121,99 @@ def main(args: DictConfig):
     # ------------------
     #       Model
     # ------------------
-    model = EVFlowNet(args.train).to(device)
+    # model = EVFlowNet(args.train).to(device)
+    model = RAFTlikeNet(args.train).to(device)
+    
+    start_epoch = 0
+    again = 0
+    if again == 1:
+        # ロードするモデルのパス 書き換え忘れずに
+        model_path = '/content/drive/MyDrive/Colab Notebooks/DLBasics2023_colab/final report/dl_lecture_competition_pub/checkpoints/noskipmodel2_epoch_3_20240704084716.pth'
+        
+        # 前回の学習状態をロード（オプション）
+        # checkpoint = torch.load(model_path)
+        checkpoint = torch.load(model_path, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        # print(checkpoint)
+        # 不要なキーを除外する
+        state_dict = {k: v for k, v in checkpoint.items() if k in model.state_dict()}
+
+        model.load_state_dict(state_dict, strict=False)
+        
+        # モデルの重みをロード
+        # model.load_state_dict(torch.load(model_path))
+        # model.load_state_dict(torch.load(model_path, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+        
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch']
 
     # ------------------
     #   optimizer
     # ------------------
     optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
+    if again==1:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    # 総ステップ数を計算
+    total_steps = len(train_data) * args.train.epochs
+
+    # ウォームアップのステップ数を設定
+    warmup_steps = total_steps // 10
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+    
+    if again==1:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     # ------------------
     #   Start training
     # ------------------
     model.train()
-    for epoch in range(args.train.epochs):
+    for epoch in range(start_epoch, args.train.epochs):
         total_loss = 0
         print("on epoch: {}".format(epoch+1))
         for i, batch in enumerate(tqdm(train_data)):
             batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
+            # event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
+            event_image_1 = batch["event_volume"].to(device)  # [B, 4, 480, 640]
+            event_image_2 = batch["event_volume_next"].to(device)  # [B, 4, 480, 640]
             ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
-            flow = model(event_image) # [B, 2, 480, 640]
+            flow = model(event_image_1,event_image_2) # [B, 2, 480, 640]
             loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            # # 各スケールの出力を取得
+            # flows = model(event_image)
+            # # マルチスケールロスを計算
+            # loss = compute_multiscale_loss(flows, ground_truth_flow)
             print(f"batch {i} loss: {loss.item()}")
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
+        #     # 定期的にモデルを保存
+        # if (epoch + 1) % 1 == 0:
+        #     if not os.path.exists('checkpoints'):
+        #         os.makedirs('checkpoints')
+        
+        #     current_time = time.strftime("%Y%m%d%H%M%S")
+        #     model_path = f"checkpoints/noskipmodel_epoch_{epoch+1}_{current_time}.pth"
+        #     torch.save(model.state_dict(), model_path)
+        #     print(f"Model saved to {model_path}")
+            
+        # # 定期的にモデルを保存
+        # if (epoch + 1) % 1 == 0:
+        #     if not os.path.exists('checkpoints'):
+        #         os.makedirs('checkpoints')
+
+        #     current_time = time.strftime("%Y%m%d%H%M%S")
+        #     model_path = f"checkpoints/noskipmodel2_epoch_{epoch + 1}_{current_time}.pth"
+        #     checkpoint = {
+        #         'epoch': epoch + 1,
+        #         'model_state_dict': model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         'scheduler_state_dict': scheduler.state_dict(),
+        #     }
+        #     torch.save(checkpoint, model_path)
+        #     print(f"Model saved to {model_path}")
+
         print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
 
     # Create the directory if it doesn't exist
@@ -149,6 +228,7 @@ def main(args: DictConfig):
     # ------------------
     #   Start predicting
     # ------------------
+    # model_path = f"checkpoints/model_20240704183548.pth"
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     flow: torch.Tensor = torch.tensor([]).to(device)
@@ -156,14 +236,16 @@ def main(args: DictConfig):
         print("start test")
         for batch in tqdm(test_data):
             batch: Dict[str, Any]
-            event_image = batch["event_volume_old"].to(device)
-            batch_flow = model(event_image) # [1, 2, 480, 640]
+            # event_image = batch["event_volume"].to(device)
+            event_image_1 = batch["event_volume"].to(device)  # [B, 4, 480, 640]
+            event_image_2 = batch["event_volume_next"].to(device)  # [B, 4, 480, 640]
+            batch_flow = model(event_image_1,event_image_2) # [1, 2, 480, 640]
             flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
         print("test done")
     # ------------------
     #  save submission
     # ------------------
-    file_name = "submission.npy"
+    file_name = "submission2"
     save_optical_flow_to_npy(flow, file_name)
 
 if __name__ == "__main__":
